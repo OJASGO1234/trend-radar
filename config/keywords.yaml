@@ -1,0 +1,34 @@
+# Keyword lists per topic. Matching is case-insensitive, whole-phrase.
+# topic_group values must match the CHECK constraint in sql/002_stream_schema.sql.
+gta6:
+  - gta 6
+  - gta6
+  - gta vi
+  - grand theft auto vi
+  - grand theft auto 6
+  - rockstar games
+  - vice city
+  - lucia and jason
+  - leonida
+  - gta 6 trailer
+  - gta 6 release date
+ai_tech:
+  - artificial intelligence
+  - machine learning
+  - llm
+  - large language model
+  - openai
+  - chatgpt
+  - gpt-5
+  - anthropic
+  - claude
+  - gemini
+  - llama
+  - mistral
+  - deepseek
+  - transformer
+  - rag
+  - ai agent
+  - fine-tuning
+  - diffusion model
+  - generative ai
