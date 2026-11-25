@@ -114,3 +114,56 @@ Is run ka log (`raw.collector_runs`, run_id=1): `status=success`, `rows_written=
 3. **Quota kaise manage kiya?** Costs ka hisaab (search 100, list 1), `Quota` class jo har call se pehle check karti hai aur 3000 ke budget par rok deti hai, batching (50 ids/call), aur comments sirf top 10 videos ke liye. Kul ~212 units/day.
 4. **Run fail ho jaye toh kaise pata chalega?** `collector_runs` mein har run `running` se shuru hota hai aur `success`/`failed` + error text par khatam. Exception par script non-zero exit code deta hai, toh GitHub Actions bhi fail dikhata hai. Row `running` par atki mile toh script crash hui thi.
 5. **API key secure kaise rakhi?** `.env` (gitignored) locally, aur GitHub Actions secrets CI mein. Code mein key kabhi hardcode nahi, aur URL (jisme key hoti hai) kabhi log nahi hota. Errors se sirf reason/message nikalte hain.
+
+
+
+---
+
+## Kafka setup (`infra/docker-compose.kafka.yml`)
+
+### Kya banaya aur kyun
+Ek single Kafka broker Docker mein, KRaft mode mein. 3 bursty producers (Bluesky, Wikipedia, HN) aur DB writer ke beech Kafka buffer ka kaam karta hai: producer tez ho ya DB slow ho, events kho nahi jaate, aur baad mein naye consumers (spike detector, LLM enrich) bina producer chhede attach ho sakte hain. Compose file mein do services hain: `kafka` (broker, `mem_limit: 900m`, heap `-Xmx512m -Xms512m`) aur `kafka-init` (one-shot job jo 3 topics banake exit ho jaata hai, `--if-not-exists` ki wajah se dobara chalana safe hai).
+
+Topics: `raw.bluesky`, `raw.wikipedia`, `raw.hackernews`, har ek 3 partitions, replication 1, `retention.ms=259200000` (3 din). `KAFKA_AUTO_CREATE_TOPICS_ENABLE=false` hai, taaki producer mein spelling mistake se chupchaap naya topic na ban jaye.
+
+### Test result (real)
+- Broker `healthy`, `Test-NetConnection localhost -Port 9092` = True (Windows host se reachable).
+- Message `hello from trend-radar` ko `raw.hackernews` mein produce kiya, phir consume: `Partition:0  Offset:0  hello from trend-radar`.
+- `docker stats`: `kafka  389.7MiB / 900MiB  (43%)`. Matlab heap 512m + JVM ka non-heap (metaspace, buffers) milake ~390 MiB idle; 900m limit ke andar comfortable.
+- (Message ke aage ek invisible BOM character dikha: yeh PowerShell 5.1 ka pipe encoding quirk hai, Kafka ka nahi. Python producers mein yeh issue nahi aayega.)
+
+### Compose file ke important lines
+- `KAFKA_PROCESS_ROLES: broker,controller`: ek hi process dono kaam karta hai (combined mode). Chhote setup ke liye perfect.
+- `KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093`: controller quorum mein sirf ek voter, node id 1, port 9093.
+- `CLUSTER_ID` fixed: data volume (`kafka-data`) ke andar cluster id likha hota hai. Agar har baar naya ID aaye toh purane volume ke saath broker start hi nahi hoga.
+- `KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1` (aur transaction log wale do): Kafka ke internal topics ka default replication 3 hota hai; ek broker par 3 replicas nahi ban sakte, toh consumer groups kabhi kaam hi nahi karte. Yeh classic single-node bug hai.
+- `KAFKA_LISTENERS` / `KAFKA_ADVERTISED_LISTENERS`: neeche detail mein.
+- `healthcheck` + `depends_on: condition: service_healthy`: init job tab chalta hai jab broker sach mein ready ho.
+
+### KRaft kya replace karta hai: ZooKeeper
+Pehle Kafka ko cluster ka metadata (kaun broker zinda hai, kis partition ka leader kaun, topic configs) store karne aur leader election ke liye alag ZooKeeper cluster chahiye tha. Matlab 2 systems chalao, monitor karo, secure karo. **KRaft** (Kafka Raft) mein Kafka ke andar hi controller nodes hain jo Raft consensus se yeh metadata ek internal log (`__cluster_metadata`) mein rakhte hain. Fayde: ek system kam, tez startup, aur hamare 3 GB Docker limit mein ek aur JVM nahi chalani padti. Kafka 4.0 se ZooKeeper support hata diya gaya hai.
+
+### Partitions, offsets, consumer groups
+- **Topic** = ek naam wala event log (jaise `raw.bluesky`).
+- **Partition** = topic ka ek ordered, append-only hissa. Topic ko 3 partitions mein baanta hai taaki parallelism mile: 3 consumers ek saath alag partitions padh sakte hain. Order sirf **ek partition ke andar** guarantee hota hai, poore topic mein nahi. Message ki key ka hash decide karta hai kaun si partition (same key = same partition).
+- **Offset** = partition ke andar message ka sequence number (0, 1, 2...). Hamare test mein `Partition:0 Offset:0`. Consumer apna "kahan tak padha" offset yaad rakhta hai, aur isiliye replay possible hai (offset peeche karo, dobara padho).
+- **Consumer group** = consumers ka ek naamed group. Kafka topic ki partitions group ke members mein baant deta hai (har partition ek time par group ke sirf ek member ko). Group ke committed offsets `__consumer_offsets` topic mein save hote hain. Alag group = alag independent reader, jo poora data dobara padh sakta hai. Hamare project mein `db_sink` ek group hoga; baad mein spike detector doosra group.
+- Hamari delivery rule: DB insert **ke baad** offset commit. Crash hua toh message dobara aayega (at-least-once), aur DB ka `ON CONFLICT DO NOTHING` duplicate rok dega.
+
+### replication=1 yahan theek kyun, prod mein kyun nahi
+Replication factor = ek partition ki kitni copies alag brokers par. Hamare paas **ek hi broker** hai, toh 2+ copies ban hi nahi sakti, aur laptop par dev data hai (raw events dobara collect/replay ho sakte hain, aur Neon mein bhi copy hai). Prod mein replication 3 + `min.insync.replicas=2` hota hai: ek broker mar jaye toh bhi data aur availability bachi rehti hai. Hamare yahan broker mara toh us waqt Kafka band, aur disk kharab hui toh 3 din ke un-sunk events gaye. Hum is risk ko jaan ke accept karte hain.
+
+### advertised.listeners itna kyun toot-ta hai
+Client pehle broker se connect hota hai (bootstrap address), broker use metadata mein **advertised address** deta hai, aur client aage ke saare connections usi address par karta hai. Agar advertised address client ke liye reachable nahi hai, toh pehla connect kaam karega par produce/consume hang ya timeout ho jaayega: sabse confusing bug.
+- Windows host se: broker `localhost:9092` advertise karta hai. Host par yeh sahi hai.
+- Lekin Docker ke andar doosre container ke liye `localhost` = *woh container khud*, broker nahi. Isliye ek **alag INTERNAL listener** `kafka:29092` (Docker DNS naam) advertise karte hain.
+- Toh ek hi broker ke do naam: host ke liye `localhost:9092`, containers ke liye `kafka:29092`. Client jis listener par connect hota hai, usi ka advertised naam wapas milta hai.
+- `KAFKA_LISTENER_SECURITY_PROTOCOL_MAP` mein har listener naam ka protocol map karna padta hai, aur `KAFKA_LISTENERS` (kahan sunna hai, `0.0.0.0`) alag cheez hai `ADVERTISED_LISTENERS` (kya batana hai) se. Yeh do settings mix hona hi sabse common galti hai.
+- Hamare setup mein isi wajah se init job `kafka:29092` use karta hai aur Windows scripts `localhost:9092`.
+
+### 5 interview questions
+1. **KRaft vs ZooKeeper?** KRaft mein metadata Kafka ke apne controller quorum mein Raft log se manage hota hai, alag ZooKeeper cluster nahi. Kam ops, tez failover/startup, aur zyada partitions scale hoti hain. ZooKeeper Kafka 4.0 mein remove ho gaya.
+2. **Ordering kahan guarantee hai?** Sirf ek partition ke andar. Same entity ka order chahiye toh usi key se produce karo, taaki hash se same partition mile.
+3. **Consumer group kaise kaam karta hai?** Group ke members partitions baant lete hain (ek partition = group mein ek consumer). Zyada consumers than partitions = kuch idle. Group ke committed offsets Kafka mein store hote hain, aur alag group independent reader hai.
+4. **At-least-once kaise mili, duplicates kaise sambhale?** Offset DB insert ke baad commit; crash par message replay. DB mein `(source, event_id)` primary key + `ON CONFLICT DO NOTHING`, toh effect exactly-once jaisa hai.
+5. **Docker mein Kafka connect kyun fail hota hai?** `advertised.listeners` galat: client bootstrap par connect hota hai, par broker jo address wapas deta hai woh client ke network se reachable nahi (jaise container ke andar `localhost`). Solution: alag listeners, host ke liye `localhost:9092`, containers ke liye `kafka:29092`.
