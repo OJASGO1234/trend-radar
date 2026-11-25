@@ -45,7 +45,7 @@ docs/learning/            dayN.md, the Hinglish explanations for Ojas
 ```
 
 ## Conventions
-- Kafka topics: `raw.bluesky`, `raw.wikipedia`, `raw.hackernews`. Common event envelope: `event_id, source, topic_tag, event_ts, ingested_ts, payload (json)`.
+- Kafka topics: `raw.bluesky`, `raw.wikipedia`, `raw.hackernews`. Common event envelope: `event_id, source, topic_group, event_ts, ingested_ts, payload (json)`. `topic_group` values are `gta6` and `ai_tech` (the CHECK constraint in `sql/002_stream_schema.sql` is the source of truth).
 - Delivery: at-least-once. The consumer commits offsets only after the DB insert succeeds; the DB stays idempotent through a unique `event_id` + `ON CONFLICT DO NOTHING`.
 - Use structured logging (no prints). Every script gets `--dry-run` and `--limit` flags for testing.
 - Small commits with clear messages.

@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 import psycopg
+import psycopg.sql
 from dotenv import load_dotenv
 
 log = logging.getLogger("apply_schema")
@@ -44,8 +45,14 @@ def main() -> int:
             "SELECT table_schema, table_name FROM information_schema.tables "
             "WHERE table_schema = 'raw' ORDER BY 1, 2"
         ).fetchall()
-    for schema, table in rows:
-        log.info("table: %s.%s", schema, table)
+        # Names come from information_schema (not user input), but quote them anyway.
+        for schema, table in rows:
+            n = conn.execute(
+                psycopg.sql.SQL("SELECT count(*) FROM {}.{}").format(
+                    psycopg.sql.Identifier(schema), psycopg.sql.Identifier(table)
+                )
+            ).fetchone()[0]
+            log.info("table: %s.%s rows=%d", schema, table, n)
     return 0
 
 
