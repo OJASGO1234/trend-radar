@@ -167,3 +167,59 @@ Client pehle broker se connect hota hai (bootstrap address), broker use metadata
 3. **Consumer group kaise kaam karta hai?** Group ke members partitions baant lete hain (ek partition = group mein ek consumer). Zyada consumers than partitions = kuch idle. Group ke committed offsets Kafka mein store hote hain, aur alag group independent reader hai.
 4. **At-least-once kaise mili, duplicates kaise sambhale?** Offset DB insert ke baad commit; crash par message replay. DB mein `(source, event_id)` primary key + `ON CONFLICT DO NOTHING`, toh effect exactly-once jaisa hai.
 5. **Docker mein Kafka connect kyun fail hota hai?** `advertised.listeners` galat: client bootstrap par connect hota hai, par broker jo address wapas deta hai woh client ke network se reachable nahi (jaise container ke andar `localhost`). Solution: alag listeners, host ke liye `localhost:9092`, containers ke liye `kafka:29092`.
+
+---
+
+## Streaming producers (`streaming/common/` + `streaming/producers/`)
+
+### Kya banaya aur kyun
+Teen producers banaye jo live data Kafka mein daalte hain: **Bluesky** (WebSocket), **Wikipedia** (SSE), **Hacker News** (polling). Teeno ek hi `streaming/common/` code share karte hain: config, keyword filter, event envelope, Kafka helper (`acks=all`, idempotence on, key = `event_id`) aur ek runtime jo `--dry-run`, `--limit`, `--duration` flags aur har 30 sec ka `seen / kept / sent` log deta hai. Har producer **Kafka se pehle** keywords se filter karta hai, kyunki Neon free tier mein storage kam hai (neeche explain).
+
+### Real test result (har producer ~2 min)
+| Producer | seen | kept | sent | failed |
+|---|---|---|---|---|
+| bluesky | 5,684 | 12 | 12 | 0 |
+| wikipedia (live) | 4,282 | 0 | 0 | 0 |
+| hackernews (live, poll 20s) | 13 | 0 | 0 | 0 |
+
+Wikipedia aur HN ka live data 2 min mein kuch match nahi hua: enwiki titles mein keyword wale pages rare hain, aur HN par ~6 items/min aate hain. Isliye maine **saved state peeche kar di** (jaise producer 2 ghante / ~450 items downtime ke baad restart hua ho): Wikipedia ne `Last-Event-ID` se ~2 ghante replay kiya (175,347 events seen, 12 kept), HN ne 469 items fetch kiye (31 kept). Yeh crash-restart path ka real test bhi tha.
+
+### File-by-file walkthrough
+- `common/config.py`: `.env` se `KAFKA_BOOTSTRAP`, `HN_POLL_SECONDS`, `WIKI_USER_AGENT`, `STATE_DIR` padhta hai. Secret kuch nahi hai yahan.
+- `common/keywords.py`: `config/keywords.yaml` se ek regex per topic_group banata hai. `(?<!\w)...(?!\w)` ka matlab **whole word**: `rag` "storage" ya "fragile" mein match nahi hoga. Lambe phrase pehle (`gta 6 trailer` > `gta 6`). Dono groups match hon toh jis group ke zyada distinct keywords, tie par `gta6`.
+- `common/envelope.py`: `make_event()` CLAUDE.md wala envelope banata hai (`event_id, source, topic_group, event_ts, ingested_ts, payload`). `payload` mein hamesha `text`, `url`, `matched_keywords` aur ek chhota `raw` copy: sink isi se `raw.stream_events` ke columns bharega.
+- `common/kafka_helper.py`: `acks=all` (saare in-sync replicas confirm karein), `enable.idempotence=True` (retry se broker ke andar duplicate nahi), key = `event_id` (same event same partition). `on_delivery` callback `sent` / `failed` count karta hai: **sent tabhi gina jata hai jab broker ne confirm kiya**, `produce()` call par nahi.
+- `common/state.py`: cursor file **atomically** likhta hai (tmp file + `os.replace`), taaki crash beech mein half file na chhode.
+- `common/backoff.py`: reconnect delay 1s, 2s, 4s... max 60s, random jitter ke saath (sab clients ek saath na tootein).
+- `common/runtime.py`: Ctrl+C par `stop` flag, 30s stats thread, exit par `flush()`.
+- `producers/bluesky.py`: Jetstream URL mein `wantedCollections=app.bsky.feed.post` (server hi sirf posts bhejta hai). Sirf `operation == create` aur `langs` mein `en`. `event_id = did/rkey` (author + record key = post ki unique pehchaan). `time_us` har message par cursor banta hai.
+- `producers/wikipedia.py`: `User-Agent` header zaroori (Wikimedia policy). `wiki == "enwiki"`, type `edit`/`new`, **sirf title** par keyword match. `event_id = meta.id` (UUID). Har event ka SSE `id:` yaad rakhta hai aur reconnect par `Last-Event-ID` header mein bhejta hai.
+- `producers/hackernews.py`: `maxitem` poll karta hai, `last_id+1 .. maxitem` ke items fetch (8 threads), story/comment filter, deleted/dead skip. Pehli baar chalne par "ab se" shuru (backfill nahi), aur lambe downtime ke baad max 500 items catch-up.
+
+### Filter Kafka se PEHLE kyun (Neon storage)
+Bluesky par ~47 posts/sec aati hain (5,684 in 2 min), jinme se sirf ~0.2% hamare keywords wali hain (12). Agar sab Kafka se Neon tak jaata toh ~4 million rows/din: Neon free tier ka storage kuch ghanton mein bhar jaata. Filter producer mein lagane ke teen fayde: (1) **Kafka disk aur network** bachta hai, (2) **Neon storage + compute hours** bachte hain (consumer kam batch insert karta hai, connection kam der khula), (3) laptop ka CPU/RAM bachta hai. Nuksaan: agar baad mein naya keyword add karein toh purana data nahi milega, kyunki jo drop hua woh gaya. Isliye keywords soch kar rakhe hain.
+
+### Push (WebSocket/SSE) vs Pull (polling)
+- **Push**: connection ek baar khulta hai, server data aate hi bhejta hai. Latency kam, request overhead nahi. Bluesky (WebSocket, dono taraf baat ho sakti hai) aur Wikipedia (SSE, sirf server → client, plain HTTP par, `Last-Event-ID` se resume built-in). Nuksaan: connection tootega, reconnect + resume khud sambhalna padta hai.
+- **Pull**: hum khud poochte hain "kuch naya?". HN ka Firebase API push nahi deta, toh `maxitem` poll karte hain. Simple aur crash-proof (state = ek number), par latency = poll interval (`HN_POLL_SECONDS`), aur har poll par request cost. Trade-off: poll interval kam = fresh data par zyada requests.
+
+### Crash / restart par kya hota hai
+Common rule: **state file tabhi aage badhti hai jab `flush()` confirm kar de ki broker ne messages le liye.** Isliye state hamesha "Kafka mein pahunche hue" se peeche ya barabar rehti hai, kabhi aage nahi. Result: at-least-once, kuch events dobara aa sakte hain, par DB ka `ON CONFLICT DO NOTHING` unhe rok dega.
+- **Bluesky**: `.state/bluesky_cursor.json` mein `time_us` (har 10s par flush ke baad save). Restart par Jetstream URL mein `cursor=` lagate hain, **2 sec peeche** se, toh beech ke events replay hote hain. Jetstream sirf kuch ghante ka replay rakhta hai; usse lamba downtime = gap. Connection toote par: backoff ke saath auto-reconnect, usi cursor se.
+- **Wikipedia**: `.state/wikipedia_last_event_id.json` mein SSE `id`. Restart par `Last-Event-ID` header bhejte hain, Wikimedia us point se replay karta hai (kuch din ki history). Hamare test mein 2 ghante peeche se 175k events replay hue.
+- **Hacker News**: `.state/hackernews_last_id.json` mein last item id. Restart par `last_id+1..maxitem` fetch hote hain, toh poll ke beech ka kuch miss nahi hota (max 500 items). Agar koi item fetch fail ho toh state **us se aage nahi badhti**, next poll par wohi dobara try hota hai.
+- Kisi bhi producer ka state file delete kar do toh: Bluesky aur Wikipedia "ab se" shuru, HN "maxitem se" shuru. Kuch crash nahi hota, bas beech ka data nahi aata.
+
+### Ek real record ka safar (dry run): Wikipedia
+1. Wikimedia SSE se event aata hai: `wiki=enwiki`, `type=edit`, `title="Grand Theft Auto VI"`, user `JT0219`, `meta.id=f6bd1adb-9348-4871-827e-f93c7f1bf283`.
+2. `to_event()`: enwiki + edit pass; `kf.match("Grand Theft Auto VI")` → `("gta6", ["grand theft auto vi"])`.
+3. Envelope: `event_id=f6bd1adb-...`, `topic_group=gta6`, `event_ts=2026-11-26T15:02:10.000+00:00`, `payload.text="Grand Theft Auto VI"`, `payload.url=https://en.wikipedia.org/w/index.php?diff=1388089449&oldid=1388088829`.
+4. Kafka: topic `raw.wikipedia`, key = `event_id`, **Partition 0, Offset 0**; `acks=all` confirm ke baad `sent` +1.
+5. Aage (db_sink, abhi nahi bana): yeh `raw.stream_events` mein `(source=wikipedia, event_id=f6bd1adb-...)` ban kar jayega; dobara aaye toh `ON CONFLICT DO NOTHING`.
+
+### 5 interview questions
+1. **Filter Kafka se pehle kyun, DB mein kyun nahi?** Volume 99.8% noise hai; pehle filter se Kafka disk, network aur Neon storage/compute bachta hai. Trade-off: jo drop hua woh replay nahi ho sakta, toh keywords soch kar rakhne padte hain.
+2. **`acks=all` + idempotence kya dete hain?** `acks=all`: write tabhi success jab saare in-sync replicas ke paas ho (data loss se bachav). Idempotence: producer retry par broker sequence numbers se duplicate drop karta hai (ek session ke andar). Hamare 1 broker par `acks=all` ka fayda limited hai, par prod config ki aadat banti hai. Restarts ke beech ke duplicates DB ke unique `event_id` se handle hote hain.
+3. **WebSocket vs SSE vs polling kab?** WebSocket: dono taraf real-time baat. SSE: sirf server→client, HTTP par, auto-reconnect aur `Last-Event-ID` built-in. Polling: jab source push nahi deta (HN) ya simple/stateless chahiye; latency = interval.
+4. **Producer crash kare toh data loss kaise rokte ho?** State (cursor/last id) sirf `flush()` ke baad save hoti hai, toh state hamesha Kafka mein confirmed data se peeche rehti hai. Restart par source se wahin se replay (Jetstream cursor, SSE `Last-Event-ID`, HN id range). Result at-least-once; dedupe DB mein `event_id` unique + `ON CONFLICT DO NOTHING`.
+5. **Message key `event_id` kyun?** Same key = same partition, aur load hash se barabar baantta hai. Dhyan: ordering sirf ek key ke andar milti hai. Hamein global order nahi chahiye, kyunki analysis `event_ts` se hota hai.
