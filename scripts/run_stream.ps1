@@ -1,17 +1,18 @@
 <#
 .SYNOPSIS
-  Start / stop / inspect the whole streaming pipeline (Kafka + 3 producers + db_sink).
+  Start / stop / inspect the whole streaming pipeline (Kafka + Prometheus/Grafana + 3 producers + db_sink).
 .EXAMPLE
   .\scripts\run_stream.ps1 start      # Kafka (docker), 3 producers, db_sink - all in the background
   .\scripts\run_stream.ps1 status
   .\scripts\run_stream.ps1 stop       # db_sink stops gracefully; producers and kafka are stopped too
-  .\scripts\run_stream.ps1 stop -KeepKafka
+  .\scripts\run_stream.ps1 stop -KeepKafka -KeepMonitoring
   .\scripts\run_stream.ps1 restart-sink
 Logs go to logs\<name>.log, PIDs to .state\pids.json.
 #>
 param(
     [Parameter(Position = 0)][ValidateSet("start", "stop", "status", "restart-sink", "kill-sink")][string]$Action = "status",
-    [switch]$KeepKafka
+    [switch]$KeepKafka,
+    [switch]$KeepMonitoring
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,6 +22,7 @@ $StateDir = Join-Path $Root ".state"
 $LogDir = Join-Path $Root "logs"
 $PidFile = Join-Path $StateDir "pids.json"
 $Compose = Join-Path $Root "infra\docker-compose.kafka.yml"
+$MonCompose = Join-Path $Root "infra\docker-compose.monitoring.yml"
 $Procs = [ordered]@{
     bluesky    = "streaming.producers.bluesky"
     wikipedia  = "streaming.producers.wikipedia"
@@ -72,6 +74,8 @@ switch ($Action) {
             if ((cmd /c "docker inspect -f {{.State.Health.Status}} kafka 2>&1") -eq "healthy") { break }
             Start-Sleep 3
         }
+        cmd /c "docker compose -f `"$MonCompose`" up -d >nul 2>&1"
+        Write-Host "monitoring up: Grafana http://localhost:3000   Prometheus http://localhost:9090"
         $pids = Get-Pids
         foreach ($n in $Procs.Keys) {
             if (Test-Alive $pids.$n) { Write-Host "$n already running pid=$($pids.$n)" } else { Start-One $n }
@@ -86,6 +90,7 @@ switch ($Action) {
             if ($n -ne "db_sink" -and (Test-Alive $pids.$n)) { Stop-Tree $pids.$n; Write-Host "stopped $n" }
         }
         Remove-Item $PidFile -ErrorAction SilentlyContinue
+        if (-not $KeepMonitoring) { cmd /c "docker compose -f `"$MonCompose`" stop >nul 2>&1"; Write-Host "monitoring stopped (data kept in volumes)" }
         if (-not $KeepKafka) { cmd /c "docker compose -f `"$Compose`" stop >nul 2>&1"; Write-Host "kafka stopped (data kept in volume)" }
     }
     "status" {
@@ -94,6 +99,8 @@ switch ($Action) {
             $state = if (Test-Alive $pids.$n) { "running pid=$($pids.$n)" } else { "stopped" }
             Write-Host ("{0,-11} {1}" -f $n, $state)
         }
+        Write-Host ("prometheus  " + (cmd /c "docker inspect -f ""{{.State.Status}}"" prometheus 2>&1"))
+        Write-Host ("grafana     " + (cmd /c "docker inspect -f ""{{.State.Status}}"" grafana 2>&1"))
         Write-Host ("kafka       " + (cmd /c "docker inspect -f ""{{.State.Status}} ({{.State.Health.Status}})"" kafka 2>&1"))
     }
 }

@@ -1,0 +1,20 @@
+groups:
+  - name: trend-radar
+    rules:
+      # The sink's /metrics endpoint has not answered for a minute: process dead or hung.
+      - alert: SinkDown
+        expr: up{job="db_sink"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "db_sink is down"
+          description: "Prometheus cannot scrape db_sink for 1m. Events pile up in Kafka (not lost), nothing reaches Neon."
+
+      # Total unprocessed messages across all topics/partitions.
+      - alert: HighLag
+        expr: sum(consumer_lag) > 1000
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "db_sink is more than 1000 messages behind"
+          description: "Total consumer lag {{ $value }} for 5m. Sink is slow, stuck on Neon retries, or producers outpace it."

@@ -29,8 +29,9 @@ class Stats:
 
 
 class EventProducer:
-    def __init__(self, bootstrap: str, client_id: str, stats: Stats):
+    def __init__(self, bootstrap: str, client_id: str, stats: Stats, metrics=None):
         self.stats = stats
+        self.metrics = metrics  # ProducerMetrics or None
         self._producer = Producer(
             {
                 "bootstrap.servers": bootstrap,
@@ -46,9 +47,13 @@ class EventProducer:
     def _on_delivery(self, err: KafkaError | None, msg: Message) -> None:
         if err is not None:
             self.stats.add(failed=1)
+            if self.metrics:
+                self.metrics.failed()
             log.error("delivery failed key=%s err=%s", msg.key(), err)
         else:
             self.stats.add(sent=1)
+            if self.metrics:
+                self.metrics.sent()
 
     def send(self, topic: str, event: dict) -> None:
         value = json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8")

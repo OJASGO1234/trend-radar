@@ -18,6 +18,8 @@ class Settings:
     state_dir: Path
     wiki_user_agent: str
     keywords_path: Path
+    metrics_addr: str
+    metrics_ports: dict
 
 
 def load_settings() -> Settings:
@@ -33,4 +35,12 @@ def load_settings() -> Settings:
             "WIKI_USER_AGENT", "trend-radar/0.1 (resume project; contact not set)"
         ),
         keywords_path=REPO_ROOT / "config" / "keywords.yaml",
+        # 0.0.0.0 so Prometheus inside Docker can reach us via host.docker.internal
+        metrics_addr=os.getenv("METRICS_ADDR", "0.0.0.0"),
+        metrics_ports={
+            "bluesky": int(os.getenv("METRICS_PORT_BLUESKY", "8001")),
+            "wikipedia": int(os.getenv("METRICS_PORT_WIKIPEDIA", "8002")),
+            "hackernews": int(os.getenv("METRICS_PORT_HACKERNEWS", "8003")),
+            "db_sink": int(os.getenv("METRICS_PORT_DB_SINK", "8004")),
+        },
     )

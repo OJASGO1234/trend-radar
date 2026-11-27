@@ -34,6 +34,7 @@ from streaming.common.backoff import Backoff
 from streaming.common.config import load_settings
 from streaming.common.envelope import SOURCES, topic_for
 from streaming.common.log import setup_logging
+from streaming.common.metrics import SinkMetrics, serve
 
 log = logging.getLogger("db_sink")
 
@@ -44,6 +45,7 @@ BATCH_MAX_ROWS = 500
 BATCH_MAX_SECONDS = 5.0
 STATS_EVERY = 30.0
 RETRY_CAP_SECONDS = 30.0
+LAG_EVERY = 10.0   # seconds between consumer-lag measurements
 
 COLUMNS = (
     "source", "event_id", "event_time", "text", "url", "matched_keywords",
@@ -137,16 +139,17 @@ def insert_batch(conn: psycopg.Connection, rows: list[Row]) -> int:
         return cur.rowcount
 
 
-def insert_isolating(conn: psycopg.Connection, rows: list[Row]) -> tuple[int, int]:
+def insert_isolating(conn: psycopg.Connection, rows: list[Row]) -> tuple[int, list[str]]:
     """Fallback after a data error: one transaction per row so a single bad row
     (e.g. a NUL character, which Postgres rejects) cannot block the other 499.
-    Returns (inserted, poison)."""
-    inserted = poison = 0
+    Returns (inserted, topics of the poison rows)."""
+    inserted = 0
+    poison: list[str] = []
     for r in rows:
         try:
             inserted += insert_batch(conn, [r])
         except psycopg.DataError as exc:
-            poison += 1
+            poison.append(r.kafka_topic)
             log.error("poison (database rejected row) topic=%s partition=%d offset=%d event_id=%s err=%s",
                       r.kafka_topic, r.kafka_partition, r.kafka_offset, r.event_id, str(exc).splitlines()[0])
     return inserted, poison
@@ -158,6 +161,7 @@ class Sink:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.stop = threading.Event()
+        self.metrics = SinkMetrics()
         self.settings = load_settings()
         self.stop_file = self.settings.state_dir / "db_sink.stop"
         self.database_url = os.environ.get("DATABASE_URL")
@@ -183,6 +187,9 @@ class Sink:
         if not self.args.dry_run and not self.database_url:
             raise SystemExit("DATABASE_URL is not set (put it in .env)")
         self.stop_file.unlink(missing_ok=True)
+        if not self.args.dry_run:   # a dry-run must not fight the real sink for the port
+            serve(self.settings.metrics_addr, self.settings.metrics_ports["db_sink"], self.metrics.registry)
+            threading.Thread(target=self._lag_loop, name="lag-probe", daemon=True).start()
         self.consumer.subscribe(TOPICS)
         log.info("started group=%s topics=%s dry_run=%s limit=%s duration=%s batch=%d rows/%.0fs",
                  GROUP_ID, TOPICS, self.args.dry_run, self.args.limit, self.args.duration,
@@ -219,6 +226,7 @@ class Sink:
             return
         self.consumed += 1
         topic, part, off = msg.topic(), msg.partition(), msg.offset()
+        self.metrics.consumed.labels(topic).inc()
         if not self.rows and not self.offsets:
             self.batch_started = time.monotonic()
         # Even a poison message advances the offset: it is "done" once we've logged it.
@@ -228,6 +236,7 @@ class Sink:
             self.rows.append(parse_message(topic, part, off, msg.value()))
         except Poison as why:
             self.poison += 1
+            self.metrics.poison.labels(topic).inc()
             log.warning("poison topic=%s partition=%d offset=%d reason=%s", topic, part, off, why)
 
     def _batch_due(self) -> bool:
@@ -252,6 +261,7 @@ class Sink:
     def _write_with_retry(self, shutting_down: bool) -> bool:
         backoff = Backoff(base=1, cap=RETRY_CAP_SECONDS)
         while True:
+            t0 = time.monotonic()
             try:
                 # Short-lived connection: Neon can scale to zero while we're idle.
                 with psycopg.connect(self.database_url, connect_timeout=15) as conn:
@@ -260,12 +270,19 @@ class Sink:
                         poison = 0
                     except psycopg.DataError as exc:
                         log.warning("batch rejected (%s); retrying row by row", str(exc).splitlines()[0])
-                        n, poison = insert_isolating(conn, self.rows)
+                        n, poison_topics = insert_isolating(conn, self.rows)
+                        poison = len(poison_topics)
+                        for t in poison_topics:
+                            self.metrics.poison.labels(t).inc()
+                dups = len(self.rows) - n - poison
+                self.metrics.batch_seconds.observe(time.monotonic() - t0)
+                self.metrics.inserted.inc(n)
+                self.metrics.duplicate.inc(dups)
                 self.inserted += n
                 self.poison += poison
-                self.duplicates += len(self.rows) - n - poison
+                self.duplicates += dups
                 log.info("batch written rows=%d inserted=%d duplicates=%d poison=%d",
-                         len(self.rows), n, len(self.rows) - n - poison, poison)
+                         len(self.rows), n, dups, poison)
                 return True
             except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
                 # Neon down / network / timeout. NOT committing offsets, so nothing can be lost.
@@ -285,11 +302,36 @@ class Sink:
         for attempt in range(1, 4):
             try:
                 self.consumer.commit(offsets=to_commit, asynchronous=False)
+                self.metrics.last_commit.set_to_current_time()
                 return
             except KafkaException as exc:
                 log.error("offset commit failed attempt=%d err=%s", attempt, exc.args[0])
                 time.sleep(attempt)
         log.error("giving up committing offsets; rows are already in the DB so a replay is harmless")
+
+    # ---- consumer lag (runs in its own thread) ----------------------------------
+    def _lag_loop(self) -> None:
+        """lag = high watermark (newest offset in the topic) - committed offset (what we are done with).
+
+        Uses a SECOND consumer that never subscribes, so it does not join the group or trigger a
+        rebalance, and it keeps measuring even while the main loop is stuck retrying Neon."""
+        probe = Consumer({"bootstrap.servers": self.settings.kafka_bootstrap, "group.id": GROUP_ID,
+                          "enable.auto.commit": False, "client.id": "db_sink-lag-probe"})
+        try:
+            while True:
+                try:
+                    parts = [TopicPartition(t, p) for t in TOPICS
+                             for p in probe.list_topics(t, timeout=10).topics[t].partitions]
+                    for tp in probe.committed(parts, timeout=10):
+                        low, high = probe.get_watermark_offsets(tp, timeout=10)
+                        done = tp.offset if tp.offset >= 0 else low   # negative = never committed
+                        self.metrics.lag.labels(tp.topic, str(tp.partition)).set(max(high - done, 0))
+                except Exception as exc:   # monitoring must never break the sink
+                    log.warning("lag probe failed err=%r", exc)
+                if self.stop.wait(LAG_EVERY):
+                    break
+        finally:
+            probe.close()
 
     # ---- stats -----------------------------------------------------------------
     def _log_stats(self, kind: str) -> None:
