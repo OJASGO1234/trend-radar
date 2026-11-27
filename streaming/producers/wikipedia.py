@@ -78,7 +78,7 @@ def main() -> None:
         session = requests.Session()
 
         def checkpoint() -> None:
-            if rt.flush() == 0 and last_id and not args.no_state and not args.dry_run:
+            if rt.checkpoint_ok() and last_id and not args.no_state and not args.dry_run:
                 save_state(state_file, {"last_event_id": last_id})
 
         while not rt.should_stop():

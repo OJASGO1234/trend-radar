@@ -75,7 +75,7 @@ def main() -> None:
 
         def checkpoint() -> None:
             # Flush FIRST: the cursor may only move past events Kafka has confirmed.
-            if rt.flush() == 0 and cursor and not args.no_state and not args.dry_run:
+            if rt.checkpoint_ok() and cursor and not args.no_state and not args.dry_run:
                 save_state(cursor_file, {"time_us": cursor})
 
         while not rt.should_stop():

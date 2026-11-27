@@ -98,7 +98,7 @@ def main() -> None:
                             if event:
                                 rt.emit(event)
                     last_id = max(new_last, last_id) if ids else last_id
-                    if rt.flush() == 0 and not args.no_state and not args.dry_run:
+                    if rt.checkpoint_ok() and not args.no_state and not args.dry_run:
                         save_state(state_file, {"last_id": last_id})
                     log.info("poll done fetched=%d last_id=%s", len(ids), last_id)
                 except requests.RequestException as exc:
