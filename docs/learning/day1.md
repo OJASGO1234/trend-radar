@@ -223,3 +223,129 @@ Common rule: **state file tabhi aage badhti hai jab `flush()` confirm kar de ki 
 3. **WebSocket vs SSE vs polling kab?** WebSocket: dono taraf real-time baat. SSE: sirf server→client, HTTP par, auto-reconnect aur `Last-Event-ID` built-in. Polling: jab source push nahi deta (HN) ya simple/stateless chahiye; latency = interval.
 4. **Producer crash kare toh data loss kaise rokte ho?** State (cursor/last id) sirf `flush()` ke baad save hoti hai, toh state hamesha Kafka mein confirmed data se peeche rehti hai. Restart par source se wahin se replay (Jetstream cursor, SSE `Last-Event-ID`, HN id range). Result at-least-once; dedupe DB mein `event_id` unique + `ON CONFLICT DO NOTHING`.
 5. **Message key `event_id` kyun?** Same key = same partition, aur load hash se barabar baantta hai. Dhyan: ordering sirf ek key ke andar milti hai. Hamein global order nahi chahiye, kyunki analysis `event_ts` se hota hai.
+
+---
+
+## Streaming consumer (`streaming/consumers/db_sink.py`)
+
+### Kya banaya aur kyun
+`db_sink` ek Kafka consumer hai (group `db_sink`) jo teeno topics (`raw.bluesky`, `raw.wikipedia`, `raw.hackernews`) padhta hai aur Neon ki `raw.stream_events` table mein **batch insert** karta hai (500 rows ya 5 sec, jo pehle ho). Producers aur DB ke beech Kafka isliye hai ki producers tez/bursty hain, aur DB writer apni raftaar se chale; DB down ho toh events Kafka mein ruke rehte hain, kuch khota nahi. Sink ka rule: **pehle DB commit, uske baad hi Kafka offset commit.** Isse at-least-once milta hai, aur `ON CONFLICT DO NOTHING` duplicates ko harmless bana deta hai. Ek aur zaroori cheez: kharab (poison) message se sink kabhi crash nahi hota.
+
+> Dhyan: CLAUDE.md mein `ON CONFLICT (event_id)` likha hai, par table ka primary key `(source, event_id)` hai (`sql/002_stream_schema.sql`). ON CONFLICT ka target PK se match karna padta hai, isliye code mein `ON CONFLICT (source, event_id)` hai. Do alag sources ka same event_id ab bhi alag rows hain.
+
+### File-by-file walkthrough (important lines)
+- `Consumer({... "enable.auto.commit": False, "auto.offset.reset": "earliest"})`: auto-commit band, kyunki auto-commit time par offset aage badha deta hai, chahe DB insert hua ho ya nahi (loss ka rasta). `earliest` ka matlab: jab group ka koi committed offset na ho (pehli run), toh topic ke shuru se padho.
+- `parse_message()`: ek message ko `Row` mein badalta hai ya `Poison` raise karta hai. Checks: valid UTF-8 JSON, JSON object, `source` known ho aur **usi topic ka ho** (`raw.bluesky` par `source=wikipedia` nahi), `event_id` non-empty string, `topic_group in (gta6, ai_tech)` (DB ke CHECK jaisa), `event_ts` parse ho, `payload` object ho, `text/url/matched_keywords` sahi type ke. Yaani DB ke CHECK/NOT NULL se pehle Python hi pakad leta hai.
+- `Sink._handle()`: har message par `offsets[(topic, partition)] = max(offset)` update hota hai, **poison par bhi**. Poison ko "done" maante hain (log karke), warna wohi message baar baar atakta rehta.
+- `_batch_due()`: `len(rows) >= 500` ya batch ke pehle message ko 5 sec ho gaye. Idle ho toh koi DB connection nahi khulta (Neon compute hours bachte hain).
+- `insert_batch()`: ek hi multi-row `INSERT ... VALUES (...), (...), ... ON CONFLICT (source, event_id) DO NOTHING` ek transaction mein. `cursor.rowcount` = sach mein jitni rows insert hui; `duplicates = batch - inserted`.
+- `insert_isolating()`: agar poore batch ko database `DataError` de (jaise text mein NUL `\x00`, Postgres allow nahi karta), toh row-by-row try karte hain taaki ek kharab row baaki 499 ko na rok de. Kharab row poison count hoti hai.
+- `_write_with_retry()`: Neon down / network error (`OperationalError`) par **offsets commit nahi karta**, backoff (1s tak 30s cap, jitter) ke saath dobara try karta hai. `max.poll.interval.ms=600000` rakha hai taaki lamba outage hone par Kafka group se na nikaale.
+- `_commit_offsets()`: Kafka mein committed offset = "agla padhne wala message", isliye `offset + 1`. Synchronous commit.
+- Shutdown: Ctrl+C / SIGTERM / `.state/db_sink.stop` file, loop ruk jaata hai, bacha batch flush, offsets commit, `consumer.close()` (group se saaf exit).
+- `--dry-run`: parse + validate karta hai, DB/commit nahi, aur alag group `db_sink-dryrun` use karta hai taaki asli sink ke offsets ya partitions na chhedein. `--limit N` / `--duration S` testing ke liye.
+
+### Real test result (laptop par, Neon free tier)
+**1) Poison:** topic `raw.hackernews` partition 0 offset 0 par ek purana "hello from trend-radar" message tha (UTF-8 BOM ke saath). Sink ne usse purge nahi kiya, bas log kiya aur aage badh gaya:
+`WARNING db_sink poison topic=raw.hackernews partition=0 offset=0 reason=not JSON (JSONDecodeError) head=b'\xef\xbb\xbfhello from trend-radar'`
+
+**2) 5+ minute end-to-end (3 producers + sink):** Neon mein final counts:
+
+| source | topic_group | rows |
+|---|---|---|
+| bluesky | ai_tech | 3,024 |
+| bluesky | gta6 | 3,299 |
+| hackernews | ai_tech | 83 |
+| wikipedia | ai_tech | 32 |
+| wikipedia | gta6 | 25 |
+| **total** | | **6,463** |
+
+(Bluesky itna zyada isliye hai ki saved cursor kal shaam ka tha, toh Jetstream ne ~16 ghante ka backlog replay kiya. Iska matlab Neon storage jaldi bharti hai; cursor purana ho toh `.state/bluesky_cursor.json` delete karke "ab se" shuru karo.)
+
+**3) Bina plan ka fault test:** run ke beech laptop/Docker network ~2 min atak gaya (Kafka fetch 101s timeout, Neon connection abort 10053). Consumer group se nikal gaya (`session timed out`), offset commit `UNKNOWN_MEMBER_ID` se fail hue, aur rejoin ke baad wahi batch dobara padha gaya: **60 duplicates, DB ne sab ignore kiye, 0 loss.** Yeh at-least-once ka asli saboot tha.
+
+**4) Sink ko kill kiya (`taskkill /F`, koi flush/commit nahi), ~90 sec baad restart:** committed offsets se aage padhna shuru hua (lag 136+147+130 Bluesky partitions par), 1,666 naye rows aaye, 0 duplicates. (Kill do batches ke beech laga tha, isliye replay nahi hua; replay ka saboot test 3 aur 5 hain.)
+
+**5) Forced replay:** `kafka-consumer-groups --reset-offsets --to-earliest` se group ko offset 0 par lautaya aur sink dobara chalaya. Saare 6,466 messages dobara padhe gaye: `inserted=0 duplicates=6465 poison=1`. DB phir bhi 6,463 rows.
+
+**6) Verification (`python -m scripts.verify_sink`)**: Kafka ko 0 se end tak padhta hai aur Neon se milata hai:
+
+```
+kafka: distinct valid (source,event_id)  : 6463
+neon : rows in raw.stream_events         : 6463
+MISSING in DB (loss)                     : 0
+EXTRA in DB (not in Kafka)               : 0
+rows pointing at a non-existent offset   : 0
+consumer lag: 0 on all 9 partitions
+RESULT: OK - no loss, no duplicates
+```
+Kafka mein `raw.bluesky` ke 6,325 messages the par distinct valid events 6,323: 2 duplicates Kafka mein hi the (producer reconnect par cursor 2s peeche karta hai). DB mein woh ek hi baar hain.
+
+### Ek real Bluesky post ka poora safar (dry run)
+**Step 1: Jetstream WebSocket frame.** `wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post&cursor=...` par yeh JSON aata hai (kuch fields chhote kar diye; `time_us` event_time se nikaala hai, baaki values real row ki hain):
+```json
+{"did": "did:plc:eekr2bqpfbdms77jwngpvfvs",
+ "time_us": 1795713348354000,
+ "kind": "commit",
+ "commit": {"operation": "create", "collection": "app.bsky.feed.post", "rkey": "3n3a6g5ojok2r",
+            "cid": "bafyreigx2vwfdxjrdn2eo5ced2u3orw7qp2h2zqtd7sd7eqvxvusuj7gme",
+            "record": {"text": "I've fallen down a Reels-hole of watching compilations of NPCs getting volleyballs spiked at them in GTA VI, and...",
+                       "langs": ["en"], "createdAt": "2026-11-26T17:15:48.026Z"}}}
+```
+**Step 2: `bluesky.to_event()`.** `kind=commit`, `operation=create`, `langs` mein `en`, toh pass. `KeywordFilter.match(text)` gives `("gta6", ["gta vi"])`. `event_id = did + "/" + rkey = did:plc:eekr2bqpfbdms77jwngpvfvs/3n3a6g5ojok2r`. `event_ts = time_us / 1e6 = 2026-11-26T17:15:48.354+00:00`.
+
+**Step 3: Kafka message** (topic `raw.bluesky`, key = `event_id` bytes, value = yeh JSON, lz4 compressed, `acks=all`):
+```json
+{"event_id": "did:plc:eekr2bqpfbdms77jwngpvfvs/3n3a6g5ojok2r", "source": "bluesky", "topic_group": "gta6",
+ "event_ts": "2026-11-26T17:15:48.354+00:00", "ingested_ts": "<producer ne us waqt ka time lagaya>",
+ "payload": {"text": "I've fallen down a Reels-hole ... GTA VI, and...",
+             "url": "https://bsky.app/profile/did:plc:eekr2bqpfbdms77jwngpvfvs/post/3n3a6g5ojok2r",
+             "matched_keywords": ["gta vi"],
+             "raw": {"did": "...", "rkey": "3n3a6g5ojok2r", "cid": "bafyrei...", "langs": ["en"], "createdAt": "2026-11-26T17:15:48.026Z", "reply": false}}}
+```
+Key ke hash se **partition 1, offset 70** mila. Producer ka `on_delivery` callback `sent += 1` karta hai.
+
+**Step 4: sink.** Message poll hua, `parse_message("raw.bluesky", 1, 70, value)` ne `Row(source="bluesky", event_id=..., event_time=2026-11-26 17:15:48.354+00, text=..., url=..., matched_keywords=["gta vi"], topic_group="gta6", payload={poora payload}, kafka_topic="raw.bluesky", kafka_partition=1, kafka_offset=70)` banaya. Yeh ek batch mein gaya jo 2026-11-27 11:20:00 UTC (16:50 IST) par insert hua.
+
+**Step 5: `raw.stream_events` row** (Neon se seedha):
+```
+source=bluesky  event_id=did:plc:eekr2bqpfbdms77jwngpvfvs/3n3a6g5ojok2r
+event_time=2026-11-26 17:15:48.354+00  topic_group=gta6  matched_keywords={"gta vi"}
+kafka_topic=raw.bluesky  kafka_partition=1  kafka_offset=70
+ingested_at=2026-11-27 11:20:00.902634+00   (DB ne default now() lagaya)
+```
+`event_time` (post kab hui) aur `ingested_at` (hamare DB mein kab aayi) alag hain: yahan ~18 ghante ka fark replay backlog ki wajah se hai.
+
+**Step 6: Kafka commit.** DB commit ke baad batch ka max offset (partition 1 par >= 70) + 1 commit hota hai. Agar yeh post dobara aaye (reset-offsets test) toh `ON CONFLICT (source, event_id) DO NOTHING`: 0 rows insert, `duplicates += 1`.
+
+### At-least-once vs exactly-once
+- **At-most-once**: pehle offset commit, phir DB. Crash par message khoya (loss).
+- **At-least-once** (hamara): pehle DB commit, phir offset commit. Crash beech mein hua toh message dobara padha jaayega: **duplicate ho sakta hai, loss nahi.**
+- **Exactly-once**: har message ka asar ek hi baar. Kafka ke andar (Kafka to Kafka) transactions + `read_committed` se mumkin hai. Par Kafka se **bahari system (Postgres)** mein Kafka transaction DB ke saath atomic nahi hota. Isliye practical tareeqa: **at-least-once + idempotent write** = "effectively once". Hamare case mein idempotency `PRIMARY KEY (source, event_id)` + `ON CONFLICT DO NOTHING` se aati hai. Yeh tabhi kaam karta hai jab event_id stable ho (Bluesky: `did/rkey`, Wikipedia: `meta.id`, HN: item id): replay par same id banta hai.
+
+### Poison message kya hota hai
+Aisa message jo **kabhi bhi process nahi ho sakta**, kitni bhi baar retry karo: JSON nahi hai, field missing hai, `topic_group` galat hai, ya DB use reject karta hai (NUL char). Agar consumer sirf crash/retry kare toh woh ek message poori partition ko hamesha ke liye atka deta hai (head-of-line blocking). Hamara tareeqa: **log (topic/partition/offset), count, skip, offset commit.** Transient error (Neon down) alag cheez hai: woh retry hota hai, skip nahi. Prod mein poison ko Dead Letter Queue topic (jaise `raw.dlq`) mein bhejte hain taaki baad mein inspect ho sake; abhi hum sirf log karte hain.
+
+### Chalane ke commands
+```powershell
+.\scripts\run_stream.ps1 start          # Kafka + 3 producers + db_sink (background, logs\*.log)
+.\scripts\run_stream.ps1 status
+.\scripts\run_stream.ps1 restart-sink   # graceful stop (stop-file) + start
+.\scripts\run_stream.ps1 kill-sink      # hard kill, for crash tests
+.\scripts\run_stream.ps1 stop           # sink graceful, baaki sab band; -KeepKafka se Kafka chalta rahe
+python -m scripts.counts                # Neon mein source/topic_group counts
+python -m scripts.verify_sink           # Kafka vs Neon: loss/duplicate check
+python -m streaming.consumers.db_sink --dry-run --limit 100
+```
+
+### Jo abhi adhoora hai (honest notes)
+- Bluesky producer ne stall ke dauran `failed=1` dikhaya: ek message ka delivery 60s timeout par fail hua. Cursor `flush()` ke baad aage badh jaata hai chahe kuch fail hua ho, toh aise rare case mein ek event producer side par kho sakta hai. Fix: cursor tabhi aage badhe jab `failed` count nahi badha.
+- Offset commit group se nikalne ke baad fail hota hai (`UNKNOWN_MEMBER_ID`); sink 3 baar try karke chhod deta hai (rows DB mein hain, replay harmless). Sahi hai, par log noisy hai.
+- Neon storage: 6.4k rows abhi chhota hai, par Bluesky backlog replay se tezi se badh sakta hai.
+
+### 5 interview questions (streaming half)
+1. **Offsets DB commit ke baad hi kyun commit karte ho?** Agar pehle commit karein aur beech mein crash ho toh message DB mein nahi pahuncha par Kafka ke hisaab se "ho gaya": permanent loss. DB pehle rakhne se worst case duplicate hai, jo unique key rokti hai. At-least-once + idempotent sink.
+2. **Exactly-once kyun nahi, aur kab milta hai?** Kafka transactions Kafka-to-Kafka ke liye atomic hain. External DB write aur Kafka offset commit ek atomic unit nahi bante, toh "effectively once" milta hai: at-least-once delivery + idempotent write (`PRIMARY KEY` + `ON CONFLICT DO NOTHING`), ya offsets ko DB mein hi usi transaction mein store karna.
+3. **Poison message ko kaise handle karte ho?** Validate karo, log karo (topic/partition/offset), count karo, skip karo aur offset commit karo; crash ya infinite retry nahi (head-of-line blocking). Prod mein DLQ topic. Transient errors (DB down) ko poison nahi maante: retry with backoff, offsets commit nahi.
+4. **Consumer group, rebalance aur partitions kya hain? Isse scale kaise hota hai?** Group ke consumers topic ke partitions aapas mein baant lete hain (ek partition ek time par ek hi consumer ko). 3 partitions = max 3 parallel sinks. Consumer zinda rehne ke liye `poll()` karta hai; `session.timeout`/`max.poll.interval` ke andar na kare toh broker use hata ke rebalance karta hai (hamare network stall mein yahi hua, aur replay ke baad duplicates ko DB ne rok liya).
+5. **Batch insert 500 rows / 5 sec kyun? Aur Neon down ho toh?** Ek-ek insert par network round trip aur transaction commit ka cost 500 guna hota; batch se throughput badhta hai aur connection kam der khula rehta hai (Neon compute hours). 5 sec ki upper bound se latency control mein. Neon down: `OperationalError` par backoff ke saath retry, offsets commit nahi, Kafka mein data safe (retention 3 din), isliye outage ke baad sink khud catch-up kar leta hai.
