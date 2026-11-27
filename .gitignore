@@ -7,3 +7,6 @@ __pycache__/
 
 # Local producer state (cursors, last seen ids)
 .state/
+
+# Runtime logs from scripts/run_stream.ps1
+logs/
