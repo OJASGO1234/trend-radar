@@ -1,61 +1,163 @@
 version: 2
 
+# NOTE: these descriptions are also read by the API (api/schema_context.py) and put into the
+# Text-to-SQL prompt, so write them for a reader who has never seen the data.
+
 models:
   - name: mart_gta_video_daily
-    description: Per video per day views/likes, views_gained (LAG) and engagement_rate.
+    description: >
+      GTA 6 YouTube videos, one row per video per snapshot day (daily stats snapshot).
+      Use it for trends over time, e.g. views gained per day for a video.
     columns:
       - name: video_day_key
+        description: Surrogate key video_id|snapshot_date.
         data_tests: [unique, not_null]
       - name: video_id
+        description: YouTube video id.
         data_tests:
           - not_null
           - relationships:
               arguments:
                 to: ref('stg_yt_videos')
                 field: video_id
+      - name: title
+        description: Video title (HTML-unescaped).
+      - name: channel_title
+        description: Name of the YouTube channel.
+      - name: is_short
+        description: True if the title contains #shorts (a YouTube Short).
+      - name: snapshot_date
+        description: Date (UTC) the stats were collected.
+      - name: views
+        description: Total view count on snapshot_date.
+      - name: likes
+        description: Total like count on snapshot_date. NULL when the channel hides likes.
+      - name: comments
+        description: Total comment count on snapshot_date.
+      - name: views_gained
+        description: Views minus the previous snapshot's views (per video). NULL on a video's first snapshot.
+      - name: days_since_prev
+        description: Days between this snapshot and the previous one (more than 1 means a missed collector day).
+      - name: engagement_rate
+        description: likes / views as a fraction (0.02 = 2%). NULL when likes are hidden.
 
   - name: mart_top_videos_latest
-    description: Latest snapshot per video with a views rank.
+    description: >
+      GTA 6 YouTube videos, one row per video, from its latest snapshot, ranked by views.
+      Use it for "top videos", "most viewed", "best engagement" questions.
     columns:
       - name: video_id
+        description: YouTube video id.
         data_tests: [unique, not_null]
+      - name: title
+        description: Video title.
+      - name: channel_title
+        description: Name of the YouTube channel.
+      - name: is_short
+        description: True if the title contains #shorts.
+      - name: published_at
+        description: When the video was published (timestamptz, UTC).
+      - name: latest_snapshot_date
+        description: Date of the snapshot these numbers come from.
+      - name: views
+        description: Latest total view count.
+      - name: likes
+        description: Latest total like count. NULL when likes are hidden.
+      - name: comments
+        description: Latest total comment count.
+      - name: engagement_rate
+        description: likes / views as a fraction (0.02 = 2%). NULL when likes are hidden.
       - name: views_rank
+        description: 1 = most viewed video.
         data_tests: [not_null]
 
   - name: mart_mentions_hourly
-    description: Mentions per hour per topic_group per source.
+    description: >
+      Real-time social/news mentions per hour (Bluesky posts, Wikipedia edits, Hacker News items that
+      matched our keywords), per topic and source. Only hours that had at least one mention appear.
     columns:
       - name: hour_topic_source_key
+        description: Surrogate key event_hour|topic_group|source.
         data_tests: [unique, not_null]
+      - name: event_hour
+        description: Start of the hour (timestamptz, UTC) in which the events happened.
+      - name: topic_group
+        description: "Topic: 'gta6' (GTA 6 launch) or 'ai_tech' (AI news)."
+        data_tests:
+          - accepted_values:
+              arguments: {values: ['gta6', 'ai_tech']}
       - name: source
+        description: "Where the mention came from: 'bluesky', 'wikipedia' or 'hackernews'."
         data_tests:
           - accepted_values:
               arguments: {values: ['bluesky', 'wikipedia', 'hackernews']}
-      - name: topic_group
-        data_tests:
-          - accepted_values:
-              arguments: {values: ['gta6', 'ai_tech']}
       - name: mentions
+        description: Number of matching events in that hour.
         data_tests: [not_null]
 
   - name: mart_keyword_daily
-    description: Keyword mentions per day.
+    description: >
+      How often each tracked keyword (for example 'gta 6', 'claude', 'openai') was mentioned per day,
+      across Bluesky, Wikipedia and Hacker News.
     columns:
       - name: day_topic_keyword_key
+        description: Surrogate key event_date|topic_group|keyword.
         data_tests: [unique, not_null]
+      - name: event_date
+        description: Date (UTC) of the mentions.
       - name: topic_group
+        description: "'gta6' or 'ai_tech'."
         data_tests:
           - accepted_values:
               arguments: {values: ['gta6', 'ai_tech']}
+      - name: keyword
+        description: The matched keyword, lower case.
+      - name: mentions
+        description: Number of events that matched this keyword that day.
 
   - name: mart_spikes
-    description: Hourly mentions per topic_group with trailing-24h mean/stddev, z-score and is_spike.
+    description: >
+      Spike detector. One row per hour per topic_group (quiet hours included, with 0 mentions).
+      Compares each hour with the trailing 24 hours using a z-score. is_spike = true marks unusual surges.
     columns:
       - name: topic_hour_key
+        description: Surrogate key topic_group|event_hour.
         data_tests: [unique, not_null]
       - name: topic_group
+        description: "'gta6' or 'ai_tech'."
         data_tests:
           - accepted_values:
               arguments: {values: ['gta6', 'ai_tech']}
+      - name: event_hour
+        description: Start of the hour (timestamptz, UTC).
+      - name: mentions
+        description: Mentions in this hour (all sources together).
+      - name: trailing_mean
+        description: Average mentions per hour over the previous 24 hours.
+      - name: trailing_stddev
+        description: Standard deviation of hourly mentions over the previous 24 hours.
+      - name: history_hours
+        description: How many previous hours were available (max 24).
+      - name: z_score
+        description: (mentions - trailing_mean) / trailing_stddev. NULL when there is no variation.
       - name: is_spike
+        description: True when z_score >= 3, mentions >= 10 and at least 6 hours of history exist.
         data_tests: [not_null]
+
+  - name: mart_pipeline_status
+    description: >
+      One row, always live (a view): when the YouTube collector last ran and whether it succeeded,
+      and when the newest streamed event happened and arrived. Use it for "is the pipeline healthy" questions.
+    columns:
+      - name: last_collector_run_at
+        description: When the most recent YouTube collector run started.
+      - name: last_collector_status
+        description: "Status of the most recent collector run: 'success', 'failed' or 'running'."
+      - name: last_collector_success_at
+        description: When the last SUCCESSFUL collector run finished.
+      - name: latest_stream_event_time
+        description: Time of the newest streamed event (Bluesky/Wikipedia/Hacker News), when it happened.
+      - name: latest_stream_ingested_at
+        description: When the newest streamed event was written to the database.
+      - name: stream_events_total
+        description: Total number of streamed events stored.
