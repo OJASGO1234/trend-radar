@@ -3,8 +3,8 @@
    wait_for_collector  ->  dbt_source_freshness  ->  dbt_build  ->  log_mart_row_counts
 
 The YouTube collector itself is NOT scheduled here: GitHub Actions runs it at 00:30 UTC
-(works with the laptop off). This DAG starts at 01:30 UTC and first WAITS until the
-collector has really finished successfully, then transforms the raw data with dbt.
+(works with the laptop off), but in practice GitHub starts it ~08:40-08:55 UTC. This DAG starts
+at 10:00 UTC and first WAITS (up to 2 h) until the collector has really finished successfully, then transforms the raw data with dbt.
 """
 from __future__ import annotations
 
@@ -77,7 +77,7 @@ def log_mart_row_counts() -> dict:
 with DAG(
     dag_id="trend_radar_daily",
     description="Wait for the collector, check source freshness, dbt build, log mart counts",
-    schedule="30 1 * * *",                       # 01:30 UTC, an hour after the GitHub Actions collector
+    schedule="0 10 * * *",                       # 10:00 UTC: GitHub Actions "00:30 UTC" cron really fires ~08:40-08:55 UTC
     start_date=pendulum.datetime(2026, 11, 20, tz="UTC"),
     catchup=False,                               # do not backfill every missed day
     max_active_runs=1,

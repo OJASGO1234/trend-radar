@@ -10,8 +10,9 @@ sources:
         loaded_at_field: ingested_at
         config:
           freshness:
+            # warn only: the streaming stack runs on a laptop and is often off. A stale stream must
+            # never block the daily DAG (no error_after = dbt never exits non-zero for this source).
             warn_after: {count: 2, period: hour}
-            error_after: {count: 24, period: hour}
       - name: yt_videos
         description: One row per GTA 6 YouTube video found by the daily collector.
       - name: yt_video_stats
@@ -19,6 +20,7 @@ sources:
         loaded_at_field: fetched_at
         config:
           freshness:
+            # blocking: error_after makes `dbt source freshness` exit non-zero and stops the DAG
             warn_after: {count: 26, period: hour}
             error_after: {count: 48, period: hour}
       - name: yt_comments
