@@ -1,0 +1,16 @@
+name: trend_radar
+version: "1.0.0"
+config-version: 2
+profile: trend_radar
+
+model-paths: ["models"]
+test-paths: ["tests"]
+
+# Everything lands in the `analytics` schema (set in profiles.yml).
+# staging = views (cheap, always fresh); marts = tables (fast to query, rebuilt by dbt build).
+models:
+  trend_radar:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

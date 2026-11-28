@@ -1,0 +1,27 @@
+version: 2
+
+sources:
+  - name: raw
+    schema: raw
+    description: Tables written directly by the collectors and the Kafka sink. dbt never writes here.
+    tables:
+      - name: stream_events
+        description: Real-time events (Bluesky, Wikipedia, Hacker News) written by streaming/consumers/db_sink.py.
+        loaded_at_field: ingested_at
+        config:
+          freshness:
+            warn_after: {count: 2, period: hour}
+            error_after: {count: 24, period: hour}
+      - name: yt_videos
+        description: One row per GTA 6 YouTube video found by the daily collector.
+      - name: yt_video_stats
+        description: One row per video per day (views / likes / comments snapshot).
+        loaded_at_field: fetched_at
+        config:
+          freshness:
+            warn_after: {count: 26, period: hour}
+            error_after: {count: 48, period: hour}
+      - name: yt_comments
+        description: Top-level comments on the collected videos.
+      - name: collector_runs
+        description: One row per collector run (status, rows written). The Airflow sensor watches this.

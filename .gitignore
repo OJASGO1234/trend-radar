@@ -10,3 +10,8 @@ __pycache__/
 
 # Runtime logs from scripts/run_stream.ps1
 logs/
+
+# dbt artifacts
+dbt/target/
+dbt/logs/
+dbt/dbt_packages/

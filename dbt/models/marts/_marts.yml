@@ -1,0 +1,61 @@
+version: 2
+
+models:
+  - name: mart_gta_video_daily
+    description: Per video per day views/likes, views_gained (LAG) and engagement_rate.
+    columns:
+      - name: video_day_key
+        data_tests: [unique, not_null]
+      - name: video_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_yt_videos')
+                field: video_id
+
+  - name: mart_top_videos_latest
+    description: Latest snapshot per video with a views rank.
+    columns:
+      - name: video_id
+        data_tests: [unique, not_null]
+      - name: views_rank
+        data_tests: [not_null]
+
+  - name: mart_mentions_hourly
+    description: Mentions per hour per topic_group per source.
+    columns:
+      - name: hour_topic_source_key
+        data_tests: [unique, not_null]
+      - name: source
+        data_tests:
+          - accepted_values:
+              arguments: {values: ['bluesky', 'wikipedia', 'hackernews']}
+      - name: topic_group
+        data_tests:
+          - accepted_values:
+              arguments: {values: ['gta6', 'ai_tech']}
+      - name: mentions
+        data_tests: [not_null]
+
+  - name: mart_keyword_daily
+    description: Keyword mentions per day.
+    columns:
+      - name: day_topic_keyword_key
+        data_tests: [unique, not_null]
+      - name: topic_group
+        data_tests:
+          - accepted_values:
+              arguments: {values: ['gta6', 'ai_tech']}
+
+  - name: mart_spikes
+    description: Hourly mentions per topic_group with trailing-24h mean/stddev, z-score and is_spike.
+    columns:
+      - name: topic_hour_key
+        data_tests: [unique, not_null]
+      - name: topic_group
+        data_tests:
+          - accepted_values:
+              arguments: {values: ['gta6', 'ai_tech']}
+      - name: is_spike
+        data_tests: [not_null]

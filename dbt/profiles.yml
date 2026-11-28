@@ -1,0 +1,21 @@
+# Reads the ONE connection string we already use everywhere: DATABASE_URL
+#   postgresql://USER:PASSWORD@HOST/DBNAME?sslmode=require
+# dbt wants separate fields, so each value below splits the URL with Jinja string methods:
+#   after "://"  ->  "USER:PASSWORD@HOST/DBNAME?sslmode=require"
+#   before "@"   ->  "USER:PASSWORD"          after "@" -> "HOST/DBNAME?sslmode=require"
+# (Assumes the password has no URL-escaped characters; Neon's generated ones don't.)
+trend_radar:
+  target: neon
+  outputs:
+    neon:
+      type: postgres
+      host: "{{ env_var('DATABASE_URL').split('://')[1].split('@')[1].split('/')[0] }}"
+      port: 5432
+      user: "{{ env_var('DATABASE_URL').split('://')[1].split('@')[0].split(':')[0] }}"
+      password: "{{ env_var('DATABASE_URL').split('://')[1].split('@')[0].split(':')[1] }}"
+      dbname: "{{ env_var('DATABASE_URL').split('://')[1].split('@')[1].split('/')[1].split('?')[0] }}"
+      schema: analytics
+      sslmode: require
+      threads: 2
+      connect_timeout: 30   # Neon may need a few seconds to wake from suspend
+      retries: 3
