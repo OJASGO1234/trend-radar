@@ -95,7 +95,7 @@ Ek task jo kaam nahi karta, **kisi condition ke sach hone ka intezaar** karta ha
 - Airflow ko collector chalane ke liye bhi lagana duplicate hota: do jagah scheduling, do jagah secrets (`YOUTUBE_API_KEY` container mein bhi), aur dono ek hi din do baar chalein toh quota double. Isliye Airflow sirf **collector ka result dekhta hai** (sensor, DB mein `collector_runs` se) aur transform side orchestrate karta hai (jahan dependencies, tests aur retries ki sach mein zaroorat hai). Dono ke beech ka contract: `raw.collector_runs` table.
 
 ### DAG ke tasks
-`trend_radar_daily`, schedule `30 1 * * *` (01:30 UTC), `catchup=False`, `max_active_runs=1`, `retries=2`, `retry_delay=5 min`:
+`trend_radar_daily`, schedule `0 10 * * *` (10:00 UTC; Day 4 mein 01:30 se badla, neeche section 9 dekho), `catchup=False`, `max_active_runs=1`, `retries=2`, `retry_delay=5 min`:
 1. `wait_for_collector` (sensor, timeout 2h)
 2. `dbt_source_freshness`: `dbt source freshness`. Error ho toh task fail; warn par pass.
 3. `dbt_build`: `dbt build` (models + tests).
@@ -116,6 +116,8 @@ Maine sensor wali stuck scheduled run ko failed mark kiya (`max_active_runs=1` k
 Run total ~1 min 5 sec. **Memory**: container startup par peak ~904 MiB (limit 1 GiB), dbt chalte waqt ~706 MiB, idle ~375-412 MiB. 1 GiB limit mein fit hota hai par margin patla hai: Airflow standalone ke saath Kafka/monitoring stack **ek saath mat chalao**.
 
 ## 9. Do cheezein jo tumhe pata honi chahiye (honest findings)
+
+> **Update (Day 4): dono fix ho gaye.** DAG ab `0 10 * * *` (10:00 UTC) par chalta hai (GitHub ka collector ~08:40-08:55 UTC par chalta hai, sensor 2h ka rakha). Aur `stream_events` freshness ab **sirf warn** hai (`error_after` hata diya), toh band stream DAG ko kabhi block nahi karega; `yt_video_stats` freshness abhi bhi blocking (error 48h). Neeche ka original analysis history ke liye rakha hai.
 1. **GitHub Actions ka "00:30 UTC" cron asal mein ~08:40-08:52 UTC par chal raha hai**: `gh run list` mein scheduled runs `2026-11-26T08:40Z` aur `2026-11-27T08:51Z` par shuru hue, yaani ~8 ghante late (GitHub scheduled workflows busy time par delay hote hain aur guarantee nahi dete). Isliye 01:30 UTC wale DAG ka sensor 2 ghante (till ~03:30 UTC) mein collector nahi dekhega aur **roz fail hoga**. Yeh spec ke hisaab se banaya hai, par sudharna padega: (a) DAG ko ~10:00 UTC par schedule karo (`schedule="0 10 * * *"`), ya (b) sensor `timeout` ~10 ghante karo, ya (c) collector ko GitHub ki jagah dusre reliable trigger se chalao. Mera suggestion (a) + sensor timeout 2h. Mujhe batao toh badal doon.
 2. `dbt source freshness` ka error 24h: jab streaming stack band rehta hai (laptop par aksar), `stream_events` 24h baad **error** ho jaayega aur DAG wahin ruk jaayega (YouTube marts bhi nahi banengi). Option: stream ke liye error_after ya DAG mein freshness ko non-blocking karna.
 
