@@ -40,6 +40,8 @@ streaming/common/         config, kafka helpers, keyword filter, event envelope
 streaming/producers/      bluesky.py, wikipedia.py, hackernews.py
 streaming/consumers/      db_sink.py
 infra/                    docker-compose.kafka.yml, docker-compose.monitoring.yml, prometheus/, grafana/
+api/                      FastAPI (api/main.py), Text-to-SQL (text_to_sql.py), SQL validator (sql_guard.py), eval set (api/eval/); reads DATABASE_URL_READONLY
+web/                      React + Vite + TypeScript UI (Overview + Ask pages); scripts/run_app.ps1 starts API + UI
 dbt/                      dbt project (staging views + marts tables in schema `analytics`); run via `python -m scripts.dbt_cli <args>`
 airflow/dags/             trend_radar_daily.py (sensor -> dbt freshness -> dbt build -> row counts); infra/docker-compose.airflow.yml
 scripts/                  run_stream.ps1 (start/stop all), verify_sink.py, counts.py
