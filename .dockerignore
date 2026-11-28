@@ -1,0 +1,10 @@
+# The Airflow image build only needs requirements-dbt.txt. Keep everything else out of the context
+# (and above all keep secrets out: .env must never be sent to the build).
+.venv/
+.git/
+.env
+.state/
+logs/
+dbt/target/
+dbt/logs/
+**/__pycache__/

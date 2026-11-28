@@ -40,6 +40,8 @@ streaming/common/         config, kafka helpers, keyword filter, event envelope
 streaming/producers/      bluesky.py, wikipedia.py, hackernews.py
 streaming/consumers/      db_sink.py
 infra/                    docker-compose.kafka.yml, docker-compose.monitoring.yml, prometheus/, grafana/
+dbt/                      dbt project (staging views + marts tables in schema `analytics`); run via `python -m scripts.dbt_cli <args>`
+airflow/dags/             trend_radar_daily.py (sensor -> dbt freshness -> dbt build -> row counts); infra/docker-compose.airflow.yml
 scripts/                  run_stream.ps1 (start/stop all), verify_sink.py, counts.py
 .github/workflows/        yt_daily.yml
 docs/learning/            dayN.md, the Hinglish explanations for Ojas

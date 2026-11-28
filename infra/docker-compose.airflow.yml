@@ -1,0 +1,40 @@
+# Airflow in ONE container: `airflow standalone` runs webserver + scheduler + triggerer together,
+# with SQLite as the metadata DB and the SequentialExecutor (one task at a time). Fine for a laptop.
+# Use scripts/run_airflow.ps1 (it passes --env-file .env so DATABASE_URL reaches the container).
+#   Up:   docker compose --env-file .env -f infra/docker-compose.airflow.yml up -d --build
+#   UI:   http://localhost:8080   user "admin"; password: docker exec airflow cat /opt/airflow/standalone_admin_password.txt
+name: trend-radar-airflow
+
+services:
+  airflow:
+    build:
+      context: ..                      # repo root (the Dockerfile copies requirements-dbt.txt)
+      dockerfile: infra/airflow/Dockerfile
+    image: trend-radar-airflow:2.10.5
+    container_name: airflow
+    mem_limit: 1g
+    ports:
+      - "8080:8080"
+    command: standalone
+    environment:
+      DATABASE_URL: "${DATABASE_URL}"  # only this one secret is passed in, not the whole .env
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "sqlite:////opt/airflow/state/airflow.db"
+      # keep RAM small: 1 web worker, 1 DAG-parsing process, parse files less often
+      AIRFLOW__WEBSERVER__WORKERS: "1"
+      AIRFLOW__SCHEDULER__PARSING_PROCESSES: "1"
+      AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "60"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+      # dbt: where the project/profile live, and where it may write (the repo mount is read-only)
+      DBT_PROJECT_DIR: /opt/airflow/repo/dbt
+      DBT_PROFILES_DIR: /opt/airflow/repo/dbt
+      DBT_TARGET_PATH: /tmp/dbt_target
+      DBT_LOG_PATH: /tmp/dbt_logs
+      DBT_BIN: /home/airflow/dbt-venv/bin/dbt
+    volumes:
+      - ../airflow/dags:/opt/airflow/dags
+      - ..:/opt/airflow/repo:ro        # the whole repo, so the DAG can run dbt/ from it
+      - airflow-state:/opt/airflow/state
+
+volumes:
+  airflow-state:
